@@ -152,6 +152,3 @@ If the virtual webcam doesn't work:
 - Check if the virtual webcam device was created (`ls /dev/video*`)
 - Run with elevated permissions if needed
 
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details. 
