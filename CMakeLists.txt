@@ -10,10 +10,12 @@ set(CMAKE_AUTOUIC ON)
 # Find required packages
 find_package(OpenCV REQUIRED COMPONENTS core imgproc highgui videoio objdetect face)
 find_package(Qt6 COMPONENTS Core Widgets REQUIRED)
+find_package(dlib REQUIRED)
 
 # Include directories
 include_directories(${OpenCV_INCLUDE_DIRS})
 include_directories(${CMAKE_SOURCE_DIR}/include)
+include_directories(${dlib_INCLUDE_DIRS})
 
 # Add Qt ui files
 set(UI_FILES
@@ -64,11 +66,13 @@ target_link_libraries(deepfakecam
     v4lconvert
     Qt6::Core
     Qt6::Widgets
+    ${dlib_LIBRARIES}
 )
 
 # Link test executable
 target_link_libraries(test_deepfake
     ${OpenCV_LIBS}
+    ${dlib_LIBRARIES}
 )
 
 # Install targets

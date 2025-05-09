@@ -7,10 +7,46 @@
 #include <vector>
 #include <filesystem>
 #include <set>
+#include <dlib/image_processing/frontal_face_detector.h>
+#include <dlib/image_processing/render_face_detections.h>
+#include <dlib/image_processing.h>
+#include <dlib/opencv.h>
 
 // Add a static frame counter for debug output
 static int debugFrameCount = 0;
 static const int maxDebugFrames = 10;
+
+// Helper: Get landmark indices for facial features (dlib 68-point)
+namespace {
+    const std::vector<int> MOUTH_IDX = {48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67};
+    const std::vector<int> LEFT_EYE_IDX = {36,37,38,39,40,41};
+    const std::vector<int> RIGHT_EYE_IDX = {42,43,44,45,46,47};
+    const std::vector<int> LEFT_BROW_IDX = {17,18,19,20,21};
+    const std::vector<int> RIGHT_BROW_IDX = {22,23,24,25,26};
+}
+
+// Helper: Warp a feature region from target to source using affine transform
+cv::Mat warpFeatureRegion(const cv::Mat& target, const std::vector<cv::Point2f>& targetLM, const std::vector<cv::Point2f>& sourceLM, const std::vector<int>& indices, const cv::Size& size) {
+    std::vector<cv::Point2f> srcPts, tgtPts;
+    for (int idx : indices) {
+        if (idx < targetLM.size() && idx < sourceLM.size()) {
+            tgtPts.push_back(targetLM[idx]);
+            srcPts.push_back(sourceLM[idx]);
+        }
+    }
+    if (srcPts.size() < 3) return cv::Mat();
+    cv::Rect bbox = cv::boundingRect(srcPts);
+    cv::Mat mask = cv::Mat::zeros(size, CV_8UC1);
+    std::vector<cv::Point> srcPtsInt;
+    for (const auto& pt : srcPts) srcPtsInt.push_back(cv::Point(cvRound(pt.x), cvRound(pt.y)));
+    cv::fillConvexPoly(mask, srcPtsInt, 255);
+    cv::Mat warpMat = cv::estimateAffinePartial2D(tgtPts, srcPts);
+    cv::Mat warped;
+    cv::warpAffine(target, warped, warpMat, size, cv::INTER_LINEAR, cv::BORDER_REFLECT_101);
+    cv::Mat feature = cv::Mat::zeros(size, target.type());
+    warped.copyTo(feature, mask);
+    return feature;
+}
 
 // Implementation class using PIMPL idiom
 class DeepFakeModelImpl {
@@ -53,6 +89,11 @@ private:
     void preserveEyes(cv::Mat& transformedFace, const cv::Mat& originalFace, const std::vector<cv::Point2f>& landmarks);
     cv::Mat createFaceMask(const cv::Size& size, const std::vector<cv::Point2f>& landmarks);
     cv::Mat normalizeColorLab(const cv::Mat& src, const cv::Mat& ref, const cv::Mat& mask);
+    
+    // dlib members
+    dlib::frontal_face_detector dlibFaceDetector;
+    dlib::shape_predictor dlibShapePredictor;
+    bool dlibInitialized = false;
 };
 
 // DeepFakeModelImpl implementation
@@ -120,6 +161,18 @@ DeepFakeModelImpl::DeepFakeModelImpl(const std::string& modelPath, DeepFakeModel
     } catch (const cv::Exception& e) {
         std::cerr << "Error loading DNN face detector: " << e.what() << std::endl;
         std::cout << "Falling back to Haar cascade detector" << std::endl;
+    }
+    
+    // Initialize dlib face detector and shape predictor
+    try {
+        dlibFaceDetector = dlib::get_frontal_face_detector();
+        dlib::deserialize("models/shape_predictor_68_face_landmarks.dat") >> dlibShapePredictor;
+        dlibInitialized = true;
+        hasLandmarkDetector = true;
+        std::cout << "dlib 68-point face landmark detector loaded successfully" << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "Failed to load dlib shape predictor: " << e.what() << std::endl;
+        dlibInitialized = false;
     }
     
     // In a real app, you would load the actual deepfake model here
@@ -216,7 +269,13 @@ cv::Mat warpFacePiecewise(const cv::Mat& target, const std::vector<cv::Point2f>&
     cv::Mat output = cv::Mat::zeros(outSize, target.type());
     cv::Rect rect(0, 0, outSize.width, outSize.height);
     cv::Subdiv2D subdiv(rect);
-    for (const auto& pt : sourceLM) subdiv.insert(pt);
+    // Insert all source landmarks (use all 68 points)
+    for (const auto& pt : sourceLM) {
+        // Clamp points to image bounds
+        float x = std::min(std::max(pt.x, 0.0f), (float)(outSize.width-1));
+        float y = std::min(std::max(pt.y, 0.0f), (float)(outSize.height-1));
+        subdiv.insert(cv::Point2f(x, y));
+    }
     std::vector<cv::Vec6f> triangleList;
     subdiv.getTriangleList(triangleList);
     auto findIndex = [](const std::vector<cv::Point2f>& pts, const cv::Point2f& p) {
@@ -254,7 +313,13 @@ cv::Mat warpFacePiecewise(const cv::Mat& target, const std::vector<cv::Point2f>&
 // Helper: create a convex hull mask from landmarks
 cv::Mat createFaceMask(const cv::Size& size, const std::vector<cv::Point2f>& landmarks) {
     cv::Mat mask = cv::Mat::zeros(size, CV_8UC1);
-    if (landmarks.size() >= 5) {
+    if (landmarks.size() >= 68) {
+        std::vector<cv::Point> hull;
+        for (const auto& pt : landmarks) hull.push_back(cv::Point(cvRound(pt.x), cvRound(pt.y)));
+        std::vector<cv::Point> hullPts;
+        cv::convexHull(hull, hullPts);
+        cv::fillConvexPoly(mask, hullPts, 255);
+    } else if (landmarks.size() >= 5) {
         std::vector<cv::Point> hull;
         for (const auto& pt : landmarks) hull.push_back(cv::Point(cvRound(pt.x), cvRound(pt.y)));
         std::vector<cv::Point> hullPts;
@@ -324,7 +389,7 @@ cv::Mat DeepFakeModelImpl::transform(const cv::Mat& inputImage, const cv::Rect& 
             targetHasLandmarks = detectLandmarks(targetFace, targetLandmarks);
             if (targetHasLandmarks && targetLandmarks.size() == sourceLandmarks.size()) {
                 warpedTargetFace = warpFacePiecewise(targetFace, targetLandmarks, sourceLandmarks, sourceFace.size());
-                // --- Fill any black (unwarped) regions with resized target face for seamlessness ---
+                // Fill any black (unwarped) regions with resized target face for seamlessness
                 cv::Mat fallbackTarget;
                 cv::resize(targetFace, fallbackTarget, sourceFace.size());
                 cv::Mat maskMissing;
@@ -332,6 +397,27 @@ cv::Mat DeepFakeModelImpl::transform(const cv::Mat& inputImage, const cv::Rect& 
                 fallbackTarget.copyTo(warpedTargetFace, maskMissing);
                 if (debugFrameCount < maxDebugFrames) {
                     cv::imwrite("debug/target_piecewise_" + std::to_string(debugFrameCount) + ".png", warpedTargetFace);
+                }
+                // --- Feature Animation ---
+                // Animate mouth, eyes, eyebrows
+                std::vector<std::pair<const std::vector<int>*, std::string>> features = {
+                    {&MOUTH_IDX, "mouth"}, {&LEFT_EYE_IDX, "left_eye"}, {&RIGHT_EYE_IDX, "right_eye"}, {&LEFT_BROW_IDX, "left_brow"}, {&RIGHT_BROW_IDX, "right_brow"}
+                };
+                for (const auto& feature : features) {
+                    cv::Mat animated = warpFeatureRegion(targetFace, targetLandmarks, sourceLandmarks, *feature.first, sourceFace.size());
+                    if (!animated.empty()) {
+                        // Use a mask for the feature
+                        std::vector<cv::Point> regionPts;
+                        for (int idx : *feature.first) {
+                            if (idx < sourceLandmarks.size())
+                                regionPts.push_back(cv::Point(cvRound(sourceLandmarks[idx].x), cvRound(sourceLandmarks[idx].y)));
+                        }
+                        if (regionPts.size() >= 3) {
+                            cv::Mat featureMask = cv::Mat::zeros(sourceFace.size(), CV_8UC1);
+                            cv::fillConvexPoly(featureMask, regionPts, 255);
+                            animated.copyTo(warpedTargetFace, featureMask);
+                        }
+                    }
                 }
             } else {
                 cv::resize(targetFace, warpedTargetFace, sourceFace.size());
@@ -341,7 +427,6 @@ cv::Mat DeepFakeModelImpl::transform(const cv::Mat& inputImage, const cv::Rect& 
         }
         // Create face mask from source landmarks
         cv::Mat faceMask = hasLandmarks ? ::createFaceMask(sourceFace.size(), sourceLandmarks) : cv::Mat::ones(sourceFace.size(), CV_8UC1) * 255;
-        // --- Ensure mask and warpedTargetFace are the same size as sourceFace ---
         if (warpedTargetFace.size() != sourceFace.size()) {
             cv::resize(warpedTargetFace, warpedTargetFace, sourceFace.size());
         }
@@ -360,7 +445,6 @@ cv::Mat DeepFakeModelImpl::transform(const cv::Mat& inputImage, const cv::Rect& 
             std::cerr << "Processed target face is empty." << std::endl;
             return inputImage.clone();
         }
-        // --- Ensure processedTargetFace and faceMask match blendedFace size ---
         if (processedTargetFace.size() != sourceFace.size()) {
             cv::resize(processedTargetFace, processedTargetFace, sourceFace.size());
         }
@@ -398,7 +482,16 @@ cv::Mat DeepFakeModelImpl::transform(const cv::Mat& inputImage, const cv::Rect& 
         if (debugFrameCount < maxDebugFrames) {
             cv::imwrite("debug/final_face_" + std::to_string(debugFrameCount) + ".png", enhancedFace);
         }
-        cv::Mat result = blendFaces(inputImage, enhancedFace, faceRect);
+        // --- Seamless blending using Poisson blending ---
+        // Find center of faceRect in inputImage
+        cv::Point center(faceRect.x + faceRect.width/2, faceRect.y + faceRect.height/2);
+        cv::Mat result;
+        try {
+            cv::seamlessClone(enhancedFace, inputImage, faceMask, center, result, cv::NORMAL_CLONE);
+        } catch (...) {
+            // Fallback to old blend if seamlessClone fails
+            result = blendFaces(inputImage, enhancedFace, faceRect);
+        }
         if (debugFrameCount < maxDebugFrames) {
             cv::imwrite("debug/output_" + std::to_string(debugFrameCount) + ".png", result);
             std::cerr << "[DEBUG] Face rect for frame " << debugFrameCount << ": (" << faceRect.x << "," << faceRect.y << "," << faceRect.width << "," << faceRect.height << ")" << std::endl;
@@ -496,99 +589,19 @@ cv::Mat DeepFakeModelImpl::preprocessFace(const cv::Mat& face) {
 }
 
 bool DeepFakeModelImpl::detectLandmarks(const cv::Mat& face, std::vector<cv::Point2f>& landmarks) {
-    if (!hasDNNFaceDetector) {
-        return false;
-    }
-    
+    if (!dlibInitialized) return false;
     try {
-        // We'll generate basic facial landmarks from face detection
-        // For more accurate landmarks, a specific landmark model would be better
-        // but this provides a reasonable approximation
-        
-        // Detect face using DNN for more accurate positioning
-        cv::Mat inputBlob = cv::dnn::blobFromImage(
-            face, 1.0, cv::Size(300, 300), 
-            cv::Scalar(104.0, 177.0, 123.0), false, false
-        );
-        
-        faceDetector.setInput(inputBlob);
-        cv::Mat detections = faceDetector.forward();
-        
-        // If no face detected in the image (should not happen as we already cropped to face)
-        if (detections.size[2] <= 0) {
-            return false;
-        }
-        
-        // Get face detection with highest confidence
-        int bestIndex = 0;
-        float bestConfidence = 0;
-        
-        for (int i = 0; i < detections.size[2]; i++) {
-            float confidence = detections.ptr<float>(0, 0, i)[2];
-            if (confidence > bestConfidence) {
-                bestConfidence = confidence;
-                bestIndex = i;
-            }
-        }
-        
-        // Get accurate face boundaries
-        float* detection = detections.ptr<float>(0, 0, bestIndex);
-        
-        if (detection[2] < confidenceThreshold) {
-            return false;
-        }
-        
-        int facePadding = 20; // Additional padding for better landmark estimation
-        int faceWidth = face.cols;
-        int faceHeight = face.rows;
-        
-        int x1 = std::max(0, static_cast<int>(detection[3] * faceWidth) - facePadding);
-        int y1 = std::max(0, static_cast<int>(detection[4] * faceHeight) - facePadding);
-        int x2 = std::min(faceWidth, static_cast<int>(detection[5] * faceWidth) + facePadding);
-        int y2 = std::min(faceHeight, static_cast<int>(detection[6] * faceHeight) + facePadding);
-        
-        // Generate landmark points based on face geometry
-        // These are basic facial landmark estimations
-        int eyeYPos = y1 + (y2 - y1) * 0.35; // Eyes are typically around 1/3 down the face
-        int mouthYPos = y1 + (y2 - y1) * 0.75; // Mouth around 3/4 down the face
-        int noseYPos = y1 + (y2 - y1) * 0.55; // Nose in the middle
-        int leftX = x1 + (x2 - x1) * 0.25; // Left side features
-        int centerX = x1 + (x2 - x1) * 0.5; // Center features
-        int rightX = x1 + (x2 - x1) * 0.75; // Right side features
-        
-        // Clear existing landmarks and add new ones (approximately 17 points)
+        dlib::cv_image<dlib::bgr_pixel> dlibImg(face);
+        std::vector<dlib::rectangle> dets = dlibFaceDetector(dlibImg);
+        if (dets.empty()) return false;
+        dlib::full_object_detection shape = dlibShapePredictor(dlibImg, dets[0]);
         landmarks.clear();
-        
-        // Add jaw line (5 points)
-        landmarks.push_back(cv::Point2f(x1, y1 + (y2 - y1) * 0.3)); // Left jaw
-        landmarks.push_back(cv::Point2f(x1 + (x2 - x1) * 0.25, y1 + (y2 - y1) * 0.55));
-        landmarks.push_back(cv::Point2f(centerX, y2 - 5)); // Chin
-        landmarks.push_back(cv::Point2f(x1 + (x2 - x1) * 0.75, y1 + (y2 - y1) * 0.55));
-        landmarks.push_back(cv::Point2f(x2, y1 + (y2 - y1) * 0.3)); // Right jaw
-        
-        // Add left eye (4 points)
-        landmarks.push_back(cv::Point2f(leftX - 15, eyeYPos));
-        landmarks.push_back(cv::Point2f(leftX, eyeYPos - 10));
-        landmarks.push_back(cv::Point2f(leftX + 15, eyeYPos));
-        landmarks.push_back(cv::Point2f(leftX, eyeYPos + 10));
-        
-        // Add right eye (4 points)
-        landmarks.push_back(cv::Point2f(rightX - 15, eyeYPos));
-        landmarks.push_back(cv::Point2f(rightX, eyeYPos - 10));
-        landmarks.push_back(cv::Point2f(rightX + 15, eyeYPos));
-        landmarks.push_back(cv::Point2f(rightX, eyeYPos + 10));
-        
-        // Add nose (1 point)
-        landmarks.push_back(cv::Point2f(centerX, noseYPos));
-        
-        // Add mouth (3 points)
-        landmarks.push_back(cv::Point2f(leftX + 10, mouthYPos));
-        landmarks.push_back(cv::Point2f(centerX, mouthYPos));
-        landmarks.push_back(cv::Point2f(rightX - 10, mouthYPos));
-        
+        for (unsigned int i = 0; i < shape.num_parts(); ++i) {
+            landmarks.push_back(cv::Point2f(shape.part(i).x(), shape.part(i).y()));
+        }
         return true;
-    } catch (const cv::Exception& e) {
-        std::cerr << "Error detecting landmarks: " << e.what() << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "dlib landmark detection error: " << e.what() << std::endl;
         return false;
     }
 }
