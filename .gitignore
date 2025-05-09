@@ -1,0 +1,60 @@
+# Build directories
+build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.o
+*.obj
+*.so
+*.dll
+*.exe
+*.out
+*.a
+*.lib
+*.app
+*.dylib
+
+# Qt/Qt Creator
+*.pro.user
+*.qmake.stash
+*.autosave
+moc_*
+ui_*
+qrc_*
+
+# Debug and test output
+debug/
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+*.swn
+*.orig
+
+# Model files (if not tracked)
+models/*.pb
+models/*.pbtxt
+models/*.caffemodel
+models/*.prototxt
+models/*.onnx
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Editor files
+.vscode/
+.idea/
+*.code-workspace
+*.sublime-workspace
+*.sublime-project
+
+# Python cache (if any)
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual webcam device files (if any)
+*.yuv 
