@@ -58,6 +58,9 @@ public:
     bool setTargetFace(const cv::Mat& targetFaceImage);
     bool loadTargetFace(const std::string& targetFacePath);
     std::vector<cv::Rect> detectFaces(const cv::Mat& image);
+    void setBlendAmount(float value) { blendAmount = value; }
+    void setFaceSize(float value) { faceSize = value; }
+    void setSmoothness(float value) { smoothness = value; }
 
 private:
     DeepFakeModel::Backend backend;
@@ -315,10 +318,18 @@ cv::Mat createFaceMask(const cv::Size& size, const std::vector<cv::Point2f>& lan
     cv::Mat mask = cv::Mat::zeros(size, CV_8UC1);
     if (landmarks.size() >= 68) {
         std::vector<cv::Point> hull;
-        for (const auto& pt : landmarks) hull.push_back(cv::Point(cvRound(pt.x), cvRound(pt.y)));
+        for (const auto& pt : landmarks)
+            hull.push_back(cv::Point(cvRound(pt.x), cvRound(pt.y)));
         std::vector<cv::Point> hullPts;
         cv::convexHull(hull, hullPts);
         cv::fillConvexPoly(mask, hullPts, 255);
+        int dilation_size = 32;
+        cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE,
+                                                   cv::Size(2 * dilation_size + 1, 2 * dilation_size + 1));
+        cv::dilate(mask, mask, kernel);
+        cv::ellipse(mask, cv::Point(size.width/2, size.height/2),
+                    cv::Size(size.width/1.7, size.height/1.5),
+                    0, 0, 360, cv::Scalar(255), -1);
     } else if (landmarks.size() >= 5) {
         std::vector<cv::Point> hull;
         for (const auto& pt : landmarks) hull.push_back(cv::Point(cvRound(pt.x), cvRound(pt.y)));
@@ -326,11 +337,13 @@ cv::Mat createFaceMask(const cv::Size& size, const std::vector<cv::Point2f>& lan
         cv::convexHull(hull, hullPts);
         cv::fillConvexPoly(mask, hullPts, 255);
     } else {
-        // Fallback: draw an oval/ellipse in the center
         cv::ellipse(mask, cv::Point(size.width/2, size.height/2),
                     cv::Size(size.width/2.2, size.height/2.2),
                     0, 0, 360, cv::Scalar(255), -1);
     }
+    // Feather the mask edge for a softer, cleaner blend
+    int feather_size = 41; // Must be odd, increase for softer edge
+    cv::GaussianBlur(mask, mask, cv::Size(feather_size, feather_size), 0);
     return mask;
 }
 
@@ -984,4 +997,8 @@ bool DeepFakeModel::loadTargetFace(const std::string& targetFacePath) {
 
 std::vector<cv::Rect> DeepFakeModel::detectFaces(const cv::Mat& image) {
     return pImpl->detectFaces(image);
-} 
+}
+
+void DeepFakeModel::setBlendAmount(float value) { pImpl->setBlendAmount(value); }
+void DeepFakeModel::setFaceSize(float value) { pImpl->setFaceSize(value); }
+void DeepFakeModel::setSmoothness(float value) { pImpl->setSmoothness(value); } 

@@ -393,19 +393,22 @@ void MainWindow::on_loadPresetButton_clicked()
 
 void MainWindow::on_blendSlider_valueChanged(int value)
 {
-    // Update blend value
+    // Update blend value in the model
+    if (deepfakeModel) deepfakeModel->setBlendAmount(value / 100.0f);
     updateStatus(QString("Blend amount set to %1%").arg(value));
 }
 
 void MainWindow::on_faceSizeSlider_valueChanged(int value)
 {
-    // Update face size value
+    // Update face size value in the model
+    if (deepfakeModel) deepfakeModel->setFaceSize(value / 50.0f); // 0-2 range
     updateStatus(QString("Face size set to %1%").arg(value));
 }
 
 void MainWindow::on_smoothnessSlider_valueChanged(int value)
 {
-    // Update smoothness value
+    // Update smoothness value in the model
+    if (deepfakeModel) deepfakeModel->setSmoothness(value / 100.0f);
     updateStatus(QString("Smoothness set to %1%").arg(value));
 }
 

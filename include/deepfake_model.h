@@ -75,6 +75,11 @@ public:
      */
     std::vector<cv::Rect> detectFaces(const cv::Mat& image);
 
+    // Add setters for transformation parameters
+    void setBlendAmount(float value);
+    void setFaceSize(float value);
+    void setSmoothness(float value);
+
 private:
     // Implementation using the PIMPL idiom to hide backend-specific details
     std::unique_ptr<DeepFakeModelImpl> pImpl;
