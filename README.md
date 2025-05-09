@@ -2,6 +2,14 @@
 
 A C++ application that applies deepfake transformations to webcam feeds in real-time and outputs to a virtual webcam.
 
+![image](https://github.com/user-attachments/assets/890c5ed8-a2fb-496a-bf35-544f704680db)
+
+![image](https://github.com/user-attachments/assets/a586c71b-a98f-4500-9bba-d325dd33739f)
+
+![image](https://github.com/user-attachments/assets/f9a67c18-81c3-43d8-a7d7-aa57874a21af)
+
+
+
 ## Features
 
 - Advanced face detection using Deep Neural Networks (DNN) with fallback to Haar cascades
