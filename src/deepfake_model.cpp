@@ -23,6 +23,7 @@ namespace {
     const std::vector<int> RIGHT_EYE_IDX = {42,43,44,45,46,47};
     const std::vector<int> LEFT_BROW_IDX = {17,18,19,20,21};
     const std::vector<int> RIGHT_BROW_IDX = {22,23,24,25,26};
+    const std::vector<int> BEARD_IDX = {5,6,7,8,9,10,11}; // Jaw/chin region
 }
 
 // Helper: Warp a feature region from target to source using affine transform
@@ -313,37 +314,26 @@ cv::Mat warpFacePiecewise(const cv::Mat& target, const std::vector<cv::Point2f>&
     return output;
 }
 
-// Helper: create a convex hull mask from landmarks
-cv::Mat createFaceMask(const cv::Size& size, const std::vector<cv::Point2f>& landmarks) {
+// Helper: create a more human-like face mask using oval + jawline
+cv::Mat createHumanFaceMask(const cv::Size& size, const std::vector<cv::Point2f>& landmarks) {
     cv::Mat mask = cv::Mat::zeros(size, CV_8UC1);
-    if (landmarks.size() >= 68) {
-        std::vector<cv::Point> hull;
-        for (const auto& pt : landmarks)
-            hull.push_back(cv::Point(cvRound(pt.x), cvRound(pt.y)));
-        std::vector<cv::Point> hullPts;
-        cv::convexHull(hull, hullPts);
-        cv::fillConvexPoly(mask, hullPts, 255);
-        int dilation_size = 32;
-        cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE,
-                                                   cv::Size(2 * dilation_size + 1, 2 * dilation_size + 1));
-        cv::dilate(mask, mask, kernel);
-        cv::ellipse(mask, cv::Point(size.width/2, size.height/2),
-                    cv::Size(size.width/1.7, size.height/1.5),
-                    0, 0, 360, cv::Scalar(255), -1);
-    } else if (landmarks.size() >= 5) {
-        std::vector<cv::Point> hull;
-        for (const auto& pt : landmarks) hull.push_back(cv::Point(cvRound(pt.x), cvRound(pt.y)));
-        std::vector<cv::Point> hullPts;
-        cv::convexHull(hull, hullPts);
-        cv::fillConvexPoly(mask, hullPts, 255);
-    } else {
-        cv::ellipse(mask, cv::Point(size.width/2, size.height/2),
-                    cv::Size(size.width/2.2, size.height/2.2),
-                    0, 0, 360, cv::Scalar(255), -1);
+    // Large oval/ellipse covering the face
+    cv::ellipse(mask, cv::Point(size.width/2, size.height/2),
+                cv::Size(size.width/2.1, size.height/1.7),
+                0, 0, 360, cv::Scalar(255), -1);
+    // Jawline (landmarks 0-16)
+    if (landmarks.size() >= 17) {
+        std::vector<cv::Point> jawPts;
+        for (int i = 0; i <= 16; ++i) {
+            jawPts.push_back(cv::Point(cvRound(landmarks[i].x), cvRound(landmarks[i].y)));
+        }
+        // Optionally add cheek/side points (landmarks 1-15)
+        cv::polylines(mask, jawPts, false, cv::Scalar(255), 10);
+        cv::fillPoly(mask, std::vector<std::vector<cv::Point>>{jawPts}, cv::Scalar(255));
     }
-    // Feather the mask edge for a softer, cleaner blend
-    int feather_size = 41; // Must be odd, increase for softer edge
-    cv::GaussianBlur(mask, mask, cv::Size(feather_size, feather_size), 0);
+    // Strong feathering for natural transition
+    int feather_size = 51; // Must be odd
+    cv::GaussianBlur(mask, mask, cv::Size(feather_size, feather_size), feather_size/2.0);
     return mask;
 }
 
@@ -367,6 +357,103 @@ cv::Mat normalizeColorLab(const cv::Mat& src, const cv::Mat& ref, const cv::Mat&
     cv::merge(srcCh, outLab);
     cv::cvtColor(outLab, outBGR, cv::COLOR_Lab2BGR);
     return outBGR;
+}
+
+// Helper: Create a feature mask from landmark indices
+cv::Mat createFeatureMask(const cv::Size& size, const std::vector<cv::Point2f>& landmarks, const std::vector<int>& indices, int dilation, int blur) {
+    cv::Mat mask = cv::Mat::zeros(size, CV_8UC1);
+    std::vector<cv::Point> pts;
+    for (int idx : indices) {
+        if (idx < landmarks.size())
+            pts.push_back(cv::Point(cvRound(landmarks[idx].x), cvRound(landmarks[idx].y)));
+    }
+    if (pts.size() >= 3) {
+        cv::fillConvexPoly(mask, pts, 255);
+        if (dilation > 0) {
+            cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(2*dilation+1, 2*dilation+1));
+            cv::dilate(mask, mask, kernel);
+        }
+        if (blur > 0) {
+            cv::GaussianBlur(mask, mask, cv::Size(blur|1, blur|1), blur/2.0);
+        }
+    }
+    return mask;
+}
+
+// Helper: Histogram matching in Lab color space for improved skin tone matching
+cv::Mat matchHistogramLab(const cv::Mat& src, const cv::Mat& ref, const cv::Mat& mask) {
+    cv::Mat srcLab, refLab;
+    cv::cvtColor(src, srcLab, cv::COLOR_BGR2Lab);
+    cv::cvtColor(ref, refLab, cv::COLOR_BGR2Lab);
+    std::vector<cv::Mat> srcCh, refCh;
+    cv::split(srcLab, srcCh);
+    cv::split(refLab, refCh);
+    for (int i = 0; i < 3; ++i) {
+        // Compute histograms for masked region
+        int histSize = 256;
+        float range[] = {0, 256};
+        const float* histRange = {range};
+        cv::Mat srcHist, refHist;
+        cv::calcHist(&srcCh[i], 1, 0, mask, srcHist, 1, &histSize, &histRange);
+        cv::calcHist(&refCh[i], 1, 0, mask, refHist, 1, &histSize, &histRange);
+        // Compute CDFs
+        cv::Mat srcCdf = srcHist.clone();
+        cv::Mat refCdf = refHist.clone();
+        for (int j = 1; j < histSize; ++j) {
+            srcCdf.at<float>(j) += srcCdf.at<float>(j-1);
+            refCdf.at<float>(j) += refCdf.at<float>(j-1);
+        }
+        srcCdf /= srcCdf.at<float>(histSize-1);
+        refCdf /= refCdf.at<float>(histSize-1);
+        // Create lookup table
+        uchar lut[256];
+        for (int j = 0; j < 256; ++j) {
+            float val = srcCdf.at<float>(j);
+            int k = 0;
+            while (k < 255 && refCdf.at<float>(k) < val) ++k;
+            lut[j] = static_cast<uchar>(k);
+        }
+        // Apply LUT
+        cv::Mat ch = srcCh[i].clone();
+        for (int y = 0; y < ch.rows; ++y) {
+            for (int x = 0; x < ch.cols; ++x) {
+                if (mask.at<uchar>(y, x) > 0) {
+                    ch.at<uchar>(y, x) = lut[ch.at<uchar>(y, x)];
+                }
+            }
+        }
+        srcCh[i] = ch;
+    }
+    cv::Mat outLab, outBGR;
+    cv::merge(srcCh, outLab);
+    cv::cvtColor(outLab, outBGR, cv::COLOR_Lab2BGR);
+    return outBGR;
+}
+
+// Helper: create a hybrid face mask (convex hull + ellipse)
+cv::Mat createHybridFaceMask(const cv::Size& size, const std::vector<cv::Point2f>& landmarks) {
+    cv::Mat hullMask = cv::Mat::zeros(size, CV_8UC1);
+    if (landmarks.size() >= 68) {
+        std::vector<cv::Point> hull;
+        for (const auto& pt : landmarks)
+            hull.push_back(cv::Point(cvRound(pt.x), cvRound(pt.y)));
+        std::vector<cv::Point> hullPts;
+        cv::convexHull(hull, hullPts);
+        cv::fillConvexPoly(hullMask, hullPts, 255);
+    }
+    // Ellipse mask centered on the face
+    cv::Mat ellipseMask = cv::Mat::zeros(size, CV_8UC1);
+    cv::Point center(size.width/2, size.height/2);
+    int ellipseW = size.width * 0.95;
+    int ellipseH = size.height * 1.10;
+    cv::ellipse(ellipseMask, center, cv::Size(ellipseW/2, ellipseH/2), 0, 0, 360, cv::Scalar(255), -1);
+    // Combine masks
+    cv::Mat hybridMask;
+    cv::max(hullMask, ellipseMask, hybridMask);
+    // Moderate feathering
+    int feather_size = 27; // Must be odd
+    cv::GaussianBlur(hybridMask, hybridMask, cv::Size(feather_size, feather_size), feather_size/2.0);
+    return hybridMask;
 }
 
 cv::Mat DeepFakeModelImpl::transform(const cv::Mat& inputImage, const cv::Rect& faceRect) {
@@ -438,19 +525,33 @@ cv::Mat DeepFakeModelImpl::transform(const cv::Mat& inputImage, const cv::Rect& 
         } else {
             cv::resize(targetFace, warpedTargetFace, sourceFace.size());
         }
-        // Create face mask from source landmarks
-        cv::Mat faceMask = hasLandmarks ? ::createFaceMask(sourceFace.size(), sourceLandmarks) : cv::Mat::ones(sourceFace.size(), CV_8UC1) * 255;
+        // Create hybrid face mask (convex hull + ellipse, moderate feathering)
+        cv::Mat faceMask = hasLandmarks ? createHybridFaceMask(sourceFace.size(), sourceLandmarks) : cv::Mat::ones(sourceFace.size(), CV_8UC1) * 255;
+        if (debugFrameCount < maxDebugFrames) {
+            cv::imwrite("debug/hybrid_face_mask_" + std::to_string(debugFrameCount) + ".png", faceMask);
+        }
+        // --- Feature-specific masks for eyebrows and beard ---
+        if (hasLandmarks && sourceLandmarks.size() >= 68) {
+            // Eyebrows
+            cv::Mat leftBrowMask = createFeatureMask(sourceFace.size(), sourceLandmarks, LEFT_BROW_IDX, 10, 21);
+            cv::Mat rightBrowMask = createFeatureMask(sourceFace.size(), sourceLandmarks, RIGHT_BROW_IDX, 10, 21);
+            // Beard (jaw/chin)
+            cv::Mat beardMask = createFeatureMask(sourceFace.size(), sourceLandmarks, BEARD_IDX, 18, 31);
+            // Combine with main mask (max)
+            cv::max(faceMask, leftBrowMask, faceMask);
+            cv::max(faceMask, rightBrowMask, faceMask);
+            cv::max(faceMask, beardMask, faceMask);
+        }
         if (warpedTargetFace.size() != sourceFace.size()) {
             cv::resize(warpedTargetFace, warpedTargetFace, sourceFace.size());
         }
         if (faceMask.size() != sourceFace.size()) {
             cv::resize(faceMask, faceMask, sourceFace.size());
         }
-        // Color normalization: match warped target face to source face in the face region
-        cv::Mat colorNormTarget = ::normalizeColorLab(warpedTargetFace, sourceFace, faceMask);
+        // Improved skin tone matching: histogram matching in Lab
+        cv::Mat colorNormTarget = matchHistogramLab(warpedTargetFace, sourceFace, faceMask);
         if (debugFrameCount < maxDebugFrames) {
-            cv::imwrite("debug/target_colornorm_" + std::to_string(debugFrameCount) + ".png", colorNormTarget);
-            cv::imwrite("debug/face_mask_" + std::to_string(debugFrameCount) + ".png", faceMask);
+            cv::imwrite("debug/target_histmatch_" + std::to_string(debugFrameCount) + ".png", colorNormTarget);
         }
         // Preprocess the color-normalized target face
         cv::Mat processedTargetFace = preprocessFace(colorNormTarget);
@@ -509,6 +610,45 @@ cv::Mat DeepFakeModelImpl::transform(const cv::Mat& inputImage, const cv::Rect& 
             cv::imwrite("debug/output_" + std::to_string(debugFrameCount) + ".png", result);
             std::cerr << "[DEBUG] Face rect for frame " << debugFrameCount << ": (" << faceRect.x << "," << faceRect.y << "," << faceRect.width << "," << faceRect.height << ")" << std::endl;
             ++debugFrameCount;
+        }
+        // --- Glasses/eye preservation: map mask to full image and blend only in faceRect ---
+        if (hasLandmarks && sourceLandmarks.size() >= 48) {
+            std::vector<int> glassesIdx;
+            for (int i = 17; i <= 26; ++i) glassesIdx.push_back(i); // eyebrows
+            for (int i = 36; i <= 47; ++i) glassesIdx.push_back(i); // eyes
+            cv::Mat glassesMask = createFeatureMask(sourceFace.size(), sourceLandmarks, glassesIdx, 4, 11);
+            if (debugFrameCount < maxDebugFrames) {
+                cv::imwrite("debug/glasses_mask_tight_" + std::to_string(debugFrameCount) + ".png", glassesMask);
+            }
+            // Map the mask and region to the correct location in the full image
+            cv::Mat fullMask = cv::Mat::zeros(result.size(), CV_8UC1);
+            cv::Rect roi = faceRect;
+            // Adjust for margin if extractFace uses margin
+            float marginScale = 0.2f * faceSize;
+            int margin = static_cast<int>(std::min(faceRect.width, faceRect.height) * marginScale);
+            roi.x = std::max(0, roi.x - margin);
+            roi.y = std::max(0, roi.y - margin);
+            roi.width = std::min(result.cols - roi.x, roi.width + 2 * margin);
+            roi.height = std::min(result.rows - roi.y, roi.height + 2 * margin);
+            if (roi.width == glassesMask.cols && roi.height == glassesMask.rows &&
+                roi.x + roi.width <= result.cols && roi.y + roi.height <= result.rows) {
+                glassesMask.copyTo(fullMask(roi));
+                for (int y = roi.y; y < roi.y + roi.height; ++y) {
+                    for (int x = roi.x; x < roi.x + roi.width; ++x) {
+                        float alpha = fullMask.at<uchar>(y, x) / 255.0f;
+                        if (alpha > 0.01f) {
+                            for (int c = 0; c < 3; ++c) {
+                                result.at<cv::Vec3b>(y, x)[c] = cv::saturate_cast<uchar>(
+                                    (1.0f - alpha) * result.at<cv::Vec3b>(y, x)[c] + alpha * inputImage.at<cv::Vec3b>(y, x)[c]
+                                );
+                            }
+                        }
+                    }
+                }
+                if (debugFrameCount < maxDebugFrames) {
+                    cv::imwrite("debug/result_after_eye_preserve_" + std::to_string(debugFrameCount) + ".png", result);
+                }
+            }
         }
         return result;
     } catch (const std::exception& e) {
